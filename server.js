@@ -44,14 +44,14 @@ const MODEL_MAPPING = {
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
   'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  'gpt-4o': 'deepseek-ai/deepseek-v4-pro',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-flash-0731',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
   'gemini-turbo': 'meta/llama-3.3-70b-instruct',
   'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
-  'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash-0731',
   'glm-5.2': 'z-ai/glm-5.2',
   'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
   'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
@@ -111,8 +111,8 @@ if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 // causing a hard failure.
 //
 // nemotron-3-super and nemotron-3-ultra also expose a `low_effort: true`
-// chat_template_kwargs flag — a middle ground between full reasoning and
-// off, but a fixed tier, not a self-deciding mode. Reachable by sending
+// chat_template_kwargs flag — a middle ground between full reasoning and off,
+// but a fixed tier, not a self-deciding mode. Reachable by sending
 // reasoning_effort: "low" on a request.
 //
 // MiniMax-M3 controls reasoning via chat_template_kwargs.thinking_mode:
@@ -129,8 +129,12 @@ if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 // output: chat_template_kwargs.enable_thinking turns thinking on, but the
 // `reasoning` field is only populated in the response if include_reasoning
 // is ALSO sent as true at the top level (confirmed against NVIDIA's VLM
-// NIM docs). Sending enable_thinking alone makes the model reason
-// internally with nothing to show for it.
+// NIM docs). Sending enable_thinking alone makes the model reason internally
+// with nothing to show for it.
+//
+// DeepSeek V4 Flash 0731 uses NVIDIA's hosted API `reasoning_effort` field.
+// The current API accepts "none", "high", and "max". NVIDIA translates this
+// field into the appropriate model chat-template reasoning configuration.
 //
 // Reasoning output format: by default, reasoning is kept out of `content`
 // and returned in a structured `reasoning`/`reasoning_content` field.
@@ -284,24 +288,22 @@ function normalizeNonStreamChoice(choice, model) {
 
 // Valid reasoning_effort values per backend model, where the backend enforces
 // an enum. Anything outside this set is dropped rather than forwarded, so a
-// bad client value fails fast in proxy logs instead of as an opaque upstream
-// 400.
+// bad client value fails fast in proxy logs instead of as an opaque upstream 400.
 const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-120b': ['low', 'medium', 'high'],
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
   'mistralai/mistral-medium-3.5-128b': ['high', 'none'],
   'mistralai/mistral-small-4-119b-2603': ['high', 'none'],
   'z-ai/glm-5.2': ['high', 'max'],
-  // Confirmed via NVIDIA's own build.nvidia.com curl examples and vLLM's
-  // official recipe docs: DeepSeek V4 accepts only these two once thinking
-  // is on. This was previously missing here, meaning literally any string a
-  // client sent was forwarded to NIM unchecked in the deepseek-v4 case below.
-  'deepseek-ai/deepseek-v4-pro': ['high', 'max'],
-  'deepseek-ai/deepseek-v4-flash': ['high', 'max'],
+
+  // Current NVIDIA API values for DeepSeek V4 Flash 0731.
+  'deepseek-ai/deepseek-v4-flash-0731': ['none', 'high', 'max'],
+
   // Not a true adaptive/effort scale — these two only expose a single extra
   // "low_effort" middle tier between full reasoning and off.
   'nvidia/nemotron-3-super-120b-a12b': ['low'],
   'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
+
   // MiniMax-M3's only non-binary option: let the model decide per-turn.
   'minimaxai/minimax-m3': ['adaptive']
 };
@@ -368,12 +370,16 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       return { chat_template_kwargs: { enable_thinking: false } };
     }
 
-    case 'deepseek-ai/deepseek-v4-pro':
-    case 'deepseek-ai/deepseek-v4-flash': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { thinking: true } };
-      if (effort) payload.chat_template_kwargs.reasoning_effort = effort;
-      return payload;
+    case 'deepseek-ai/deepseek-v4-flash-0731': {
+      // NVIDIA's current hosted API exposes reasoning_effort directly.
+      // Allowed values are "none", "high", and "max".
+      if (!enableThinking || effort === 'none') {
+        return { reasoning_effort: 'none' };
+      }
+
+      return {
+        reasoning_effort: effort || 'high'
+      };
     }
 
     case 'openai/gpt-oss-120b':
@@ -464,8 +470,8 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
 //     with any model in MODEL_MAPPING/FALLBACK_MODELS.
 //
 // Because it's an intermittent upstream parser failure rather than a model
-// that flatly lacks tool-call support, it can't be fixed by routing around a
-// specific model — it has to be caught and repaired wherever it happens.
+// that flatly lacks tool-call support, it can't be fixed by routing around
+// a specific model — it has to be caught and repaired wherever it happens.
 // This recovery layer runs unconditionally (streaming and non-streaming) and
 // is a no-op with negligible overhead when the tag never appears.
 
