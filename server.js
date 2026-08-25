@@ -19,12 +19,21 @@ const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
+// Single consolidated debug flag. Replaces the old DEBUG_REASONING var —
+// that was on track to become DEBUG_REASONING + DEBUG_FALLBACK + a new one
+// every time a new subsystem needed debug output, which just means more env
+// vars to remember at 2am. DEBUG_MODE=true turns on every verbose debug log
+// in this file: reasoning payload per fallback attempt, plus the full
+// request body and upstream error response on fallback failures.
+const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
+
 const MAX_TOKENS_LIMIT = 65536;
 const REQUEST_TIMEOUT_MS = 180000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
 if (ENABLE_THINKING_MODE) console.log('[CONFIG] Thinking mode: ENABLED');
+if (DEBUG_MODE) console.log('[CONFIG] Debug mode: ENABLED (verbose reasoning + fallback logging)');
 
 // ─── Config validation ──────────────────────────────────────────────────────
 
@@ -44,7 +53,6 @@ const MODEL_MAPPING = {
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
   'gpt-4-turbo': 'moonshotai/kimi-k2.6',
-  'gpt-4o': 'deepseek-ai/deepseek-v4-flash-0731',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
@@ -52,7 +60,6 @@ const MODEL_MAPPING = {
   'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
   'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash-0731',
-  'glm-5.2': 'z-ai/glm-5.2',
   'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
   'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
   'mistral-pro': 'mistralai/mistral-small-4-119b-2603',
@@ -99,12 +106,6 @@ if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 // Confirmed against NVIDIA's own curl docs, which send chat_template_kwargs
 // directly at the top level.
 //
-// GLM models think by default. `reasoning_effort` only controls thinking
-// *intensity* once thinking is already happening — it does NOT turn thinking
-// off. The actual on/off switch is the top-level `thinking: { type: "enabled"
-// | "disabled" }` field (per z.ai's docs). GLM-5.2 accepts only "high" or
-// "max" for reasoning_effort, with "max" as the default.
-//
 // nemotron-3-ultra's `force_nonempty_content` flag is NOT a confirmed NVIDIA
 // parameter — left in as opt-in/best-effort since unrecognized
 // chat_template_kwargs are typically ignored by the backend rather than
@@ -132,9 +133,16 @@ if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
 // NIM docs). Sending enable_thinking alone makes the model reason internally
 // with nothing to show for it.
 //
-// DeepSeek V4 Flash 0731 uses NVIDIA's hosted API `reasoning_effort` field.
-// The current API accepts "none", "high", and "max". NVIDIA translates this
-// field into the appropriate model chat-template reasoning configuration.
+// DeepSeek V4 Flash 0731 controls reasoning via chat_template_kwargs:
+// { thinking: bool, reasoning_effort: "low"|"high"|"max" } — confirmed
+// against NVIDIA's own published code sample for this exact model on
+// build.nvidia.com, which sends reasoning nested inside chat_template_kwargs
+// via extra_body, not as a bare top-level field. `thinking` is the on/off
+// switch; `reasoning_effort` only controls intensity once thinking is on.
+// (Previously this proxy sent a bare top-level reasoning_effort field here,
+// which NIM doesn't recognize for this model — that's why requests to
+// deepseek-v4-flash-0731 were failing outright and silently falling back to
+// FALLBACK_MODELS instead of ever reaching DeepSeek.)
 //
 // Reasoning output format: by default, reasoning is kept out of `content`
 // and returned in a structured `reasoning`/`reasoning_content` field.
@@ -294,10 +302,13 @@ const REASONING_EFFORT_ENUMS = {
   'openai/gpt-oss-20b': ['low', 'medium', 'high'],
   'mistralai/mistral-medium-3.5-128b': ['high', 'none'],
   'mistralai/mistral-small-4-119b-2603': ['high', 'none'],
-  'z-ai/glm-5.2': ['high', 'max'],
 
-  // Current NVIDIA API values for DeepSeek V4 Flash 0731.
-  'deepseek-ai/deepseek-v4-flash-0731': ['none', 'high', 'max'],
+  // Confirmed against NVIDIA's own build.nvidia.com code sample for this
+  // model: reasoning_effort lives inside chat_template_kwargs (see
+  // getReasoningPayload below), and only "low"/"high"/"max" are valid —
+  // there's no "none" value; thinking is toggled off separately via
+  // chat_template_kwargs.thinking: false.
+  'deepseek-ai/deepseek-v4-flash-0731': ['low', 'high', 'max'],
 
   // Not a true adaptive/effort scale — these two only expose a single extra
   // "low_effort" middle tier between full reasoning and off.
@@ -326,7 +337,7 @@ function validReasoningEffort(model, effort) {
 // UNIVERSAL CLIENT OVERRIDE: reasoning_effort: "off" / "on" forces thinking
 // off/on for that one request, regardless of the server's ENABLE_THINKING_MODE
 // default. This exists because, before it was added, the on/off decision for
-// 8 of the 10 reasoning models below (everything except mistral's accidental
+// 7 of the 9 reasoning models below (everything except mistral's accidental
 // "none" and M3's "adaptive") was wired to the server env var ONLY — a
 // client-side reasoning toggle in any chat UI had no field it could send that
 // actually changed anything for those models. "off"/"on" are stripped before
@@ -371,14 +382,23 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
     }
 
     case 'deepseek-ai/deepseek-v4-flash-0731': {
-      // NVIDIA's current hosted API exposes reasoning_effort directly.
-      // Allowed values are "none", "high", and "max".
-      if (!enableThinking || effort === 'none') {
-        return { reasoning_effort: 'none' };
+      // Confirmed against NVIDIA's own build.nvidia.com code sample for this
+      // exact model: reasoning is controlled via chat_template_kwargs —
+      // { thinking: bool, reasoning_effort: "low"|"high"|"max" } — NOT a
+      // bare top-level reasoning_effort field. The sample sends
+      // extra_body={"chat_template_kwargs":{"thinking":True,"reasoning_effort":"high"}},
+      // which the openai SDK unwraps into exactly those two fields at the
+      // top level of the JSON body (see extra_body note at the top of this
+      // file) — this is what we build by hand here.
+      if (!enableThinking) {
+        return { chat_template_kwargs: { thinking: false } };
       }
 
       return {
-        reasoning_effort: effort || 'high'
+        chat_template_kwargs: {
+          thinking: true,
+          reasoning_effort: effort || 'high'
+        }
       };
     }
 
@@ -394,17 +414,6 @@ function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTo
       if (effort) return { reasoning_effort: effort };
       if (enableThinking) return { reasoning_effort: 'high' };
       return {};
-    }
-
-    case 'z-ai/glm-5.2': {
-      // GLM-5.2 thinks by default. `reasoning_effort` only controls
-      // intensity (max vs high) once thinking is already happening — it does
-      // NOT turn thinking off. The actual on/off switch is `thinking.type`.
-      const payload = {
-        thinking: { type: enableThinking ? 'enabled' : 'disabled' }
-      };
-      if (enableThinking && effort) payload.reasoning_effort = effort;
-      return payload;
     }
 
     case 'google/gemma-4-31b-it': {
@@ -648,7 +657,7 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
-  if (req.path === '/health' || req.path === '/v1/models') {
+  if (req.path === '/health' || req.path === '/v1/models' || req.path === '/') {
     return next();
   }
 
@@ -678,6 +687,22 @@ app.use((req, res, next) => {
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
+// Fetches the live set of model IDs currently in NIM's catalog. Shared by
+// the startup validateModels() check and the GET /v1/models?live=true route
+// below, so there's one implementation of "ask NIM what's actually there"
+// instead of two that can quietly drift apart.
+async function fetchLiveModelIds() {
+  const response = await axios.get(`${NIM_API_BASE}/models`, {
+    headers: {
+      Authorization: `Bearer ${NIM_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: VALIDATION_TIMEOUT_MS
+  });
+
+  return new Set((response.data.data || []).map(m => m.id));
+}
+
 async function validateModels() {
   if (SKIP_VALIDATION) {
     console.log('[VALIDATION] Skipped (SKIP_VALIDATION=true)');
@@ -686,17 +711,7 @@ async function validateModels() {
 
   console.log('[VALIDATION] Checking model availability via /v1/models...');
   try {
-    const response = await axios.get(`${NIM_API_BASE}/models`, {
-      headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: VALIDATION_TIMEOUT_MS
-    });
-
-    const availableModels = new Set(
-      (response.data.data || []).map(m => m.id)
-    );
+    const availableModels = await fetchLiveModelIds();
 
     const invalid = [];
     for (const [alias, nimId] of Object.entries(MODEL_MAPPING)) {
@@ -763,17 +778,19 @@ function safeWrite(res, data) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
-  const debugReasoning = process.env.DEBUG_REASONING === 'true';
 
   for (const model of models) {
+    const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
+    const fullRequest = { ...baseRequest, model, ...reasoningPayload };
+
+    if (DEBUG_MODE) {
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload));
+    }
+
     try {
-      const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
-      if (debugReasoning) {
-        console.log(`[REASONING] Attempting ${model} with payload:`, JSON.stringify(reasoningPayload));
-      }
       const res = await axios.post(
         `${NIM_API_BASE}/chat/completions`,
-        { ...baseRequest, model, ...reasoningPayload },
+        fullRequest,
         {
           headers: {
             Authorization: `Bearer ${NIM_API_KEY}`,
@@ -791,6 +808,14 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         err.response?.status,
         err.response?.data?.error?.message || err.message
       );
+      // The full request body + full upstream error, not just the one-line
+      // message above. This is exactly what would've surfaced the
+      // deepseek-v4-flash-0731 bug in one request instead of requiring a
+      // manual trawl through NVIDIA's docs to spot a bad payload shape.
+      if (DEBUG_MODE) {
+        console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
+        console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
+      }
     }
   }
 
@@ -799,24 +824,111 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.4.0' });
+// People keep pasting the base deployment URL into a browser to "check if
+// it's up" and getting a raw 403 from the auth middleware below, since
+// there's nothing registered at "/" and a browser sends no Authorization
+// header. That reads as "the proxy is down" when it isn't — this route
+// exists purely to stop that specific class of help request.
+app.get('/', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NIM Proxy — running</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0b0f14;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    text-align: center;
+    padding: 24px;
+  }
+  .card { max-width: 480px; }
+  h1 { font-size: 1.3rem; margin: 0 0 0.75rem; }
+  p { color: #9aa7b2; line-height: 1.55; margin: 0.5rem 0; }
+  code { background: #161b22; padding: 2px 6px; border-radius: 4px; color: #7ee787; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>✅ This is working — it's just not a website</h1>
+    <p>This is an OpenAI-compatible API proxy, not something you browse. Nothing is broken. There's just nothing to show at the root path.</p>
+    <p>If someone sent you this link to check whether it's up: yes, it's up.</p>
+    <p>To actually use it, point an OpenAI-compatible client at <code>/v1/chat/completions</code> with an <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
+    <p>Quick status check (no token needed): <code>/health</code></p>
+    <p><a href="https://github.com/skywalker14017/nim-to-openai-proxy" style="color:#7ee787;">Full docs / setup on GitHub →</a></p>
+  </div>
+</body>
+</html>`);
 });
 
-app.get('/v1/models', (req, res) => {
-  res.json({
-    object: 'list',
-    data: Object.keys(MODEL_MAPPING).map(id => ({
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', version: '2.5.0' });
+});
+
+app.get('/v1/models', async (req, res) => {
+  // Default path: unchanged from before, no network round trip, same exact
+  // shape. Kept fast and static so anything hitting this route unconditionally
+  // (most OpenAI-compatible clients ping it on startup) isn't affected by the
+  // live check's latency or failure modes.
+  if (req.query.live !== 'true') {
+    return res.json({
+      object: 'list',
+      data: Object.keys(MODEL_MAPPING).map(id => ({
+        id,
+        object: 'model',
+        // OpenAI's spec documents this field in Unix seconds, not milliseconds
+        // — Date.now() alone is 1000x too large and inconsistent with the
+        // correctly-converted timestamp used below in the chat completions
+        // response.
+        created: Math.floor(Date.now() / 1000),
+        owned_by: 'nim-proxy'
+      }))
+    });
+  }
+
+  // ?live=true cross-checks every alias's backend model ID against NIM's
+  // actual current catalog right now, on demand — instead of only at startup
+  // via validateModels(), or getting quietly absorbed by FALLBACK_MODELS the
+  // next time someone actually sends a chat request. This is exactly the
+  // check that would've caught the deepseek-v4-flash-0731 payload issue's
+  // sibling problem (a backend ID silently falling out of the catalog, e.g.
+  // the deepseek-v4-pro removal) immediately instead of by accident.
+  try {
+    const availableModels = await fetchLiveModelIds();
+    const data = Object.entries(MODEL_MAPPING).map(([id, backend]) => ({
       id,
       object: 'model',
-      // OpenAI's spec documents this field in Unix seconds, not milliseconds
-      // — Date.now() alone is 1000x too large and inconsistent with the
-      // correctly-converted timestamp used below in the chat completions
-      // response.
       created: Math.floor(Date.now() / 1000),
-      owned_by: 'nim-proxy'
-    }))
-  });
+      owned_by: 'nim-proxy',
+      backend,
+      available: availableModels.has(backend)
+    }));
+
+    res.json({
+      object: 'list',
+      data,
+      live_check: {
+        checked_at: new Date().toISOString(),
+        unavailable_aliases: data.filter(m => !m.available).map(m => m.id)
+      }
+    });
+  } catch (err) {
+    console.warn(`[MODELS] Live check failed: ${err.message}`);
+    res.status(502).json({
+      error: {
+        message: `Live model check against NIM failed: ${err.message}`,
+        type: 'live_check_error',
+        code: 502
+      }
+    });
+  }
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
@@ -1240,3 +1352,4 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
+
