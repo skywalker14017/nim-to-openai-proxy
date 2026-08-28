@@ -1,11 +1,14 @@
 // server.js — OpenAI-compatible proxy for NVIDIA NIM
-// Express 5 compatible.
+// Express 5 compatible. Reasoning-payload logic lives in reasoning.js,
+// tool-call leak recovery lives in tools.js.
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { StringDecoder } = require('string_decoder');
 const { timingSafeEqual } = require('crypto');
+const { SHOW_REASONING, getReasoningPayload, resolveEffectiveThinking, StreamNormalizer, normalizeNonStreamChoice } = require('./reasoning');
+const { extractLeakedToolCalls, ToolCallStreamRecovery } = require('./tools');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,16 +22,27 @@ const ENABLE_THINKING_MODE = process.env.ENABLE_THINKING_MODE === 'true';
 const SKIP_VALIDATION = process.env.SKIP_VALIDATION === 'true';
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// Single consolidated debug flag. Replaces the old DEBUG_REASONING var —
-// that was on track to become DEBUG_REASONING + DEBUG_FALLBACK + a new one
-// every time a new subsystem needed debug output, which just means more env
-// vars to remember at 2am. DEBUG_MODE=true turns on every verbose debug log
-// in this file: reasoning payload per fallback attempt, plus the full
-// request body and upstream error response on fallback failures.
+// DEBUG_MODE=true enables verbose logging: the reasoning payload sent on
+// each fallback attempt, plus the full request body and upstream error
+// response whenever an attempt fails.
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 
 const MAX_TOKENS_LIMIT = 65536;
-const REQUEST_TIMEOUT_MS = 180000;
+
+// Time-to-first-byte ceiling for a model attempt before it's treated as
+// failed and the fallback chain moves to the next model. Reasoning models
+// get a longer allowance since "thinking" before the first token can
+// legitimately take much longer than a small fast model — a single shared
+// timeout would misread a slow-but-working reasoning attempt as failed and
+// demote it to a weaker fallback that never even tried to think.
+//
+// Both values are env-configurable, but check them against your deployment
+// platform's own function/request duration limit before raising them — a
+// timeout set longer than the platform allows just means the platform kills
+// the request first, regardless of what's configured here (e.g. serverless
+// platforms commonly cap function duration well under 10 minutes by default).
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 180000;
+const REASONING_REQUEST_TIMEOUT_MS = Number(process.env.REASONING_REQUEST_TIMEOUT_MS) || 480000;
 const VALIDATION_TIMEOUT_MS = 15000;
 const MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
 
@@ -52,7 +66,7 @@ const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
   'gpt-3.5': 'qwen/qwen3.5-397b-a17b',
-  'gpt-4-turbo': 'moonshotai/kimi-k2.6',
+  'gpt-4-turbo': 'moonshotai/kimi-k3', // was kimi-k2.6 — NVIDIA pulled it from the NIM catalog (2026-08-27), kimi-k3 is its replacement
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
@@ -60,6 +74,7 @@ const MODEL_MAPPING = {
   'gemini-turbo?': 'abacusai/dracarys-llama-3.1-70b-instruct',
   'gpt-3.5o': 'nvidia/nemotron-mini-4b-instruct',
   'gpt-4-flash': 'deepseek-ai/deepseek-v4-flash-0731',
+  'gpt-4o': 'deepseek-ai/deepseek-v4-pro-0813',
   'mistral': 'mistralai/mistral-large-3-675b-instruct-2512',
   'mistral-turbo': 'mistralai/mistral-medium-3.5-128b',
   'mistral-pro': 'mistralai/mistral-small-4-119b-2603',
@@ -84,543 +99,16 @@ const FALLBACK_MODELS = [
   'google/gemma-4-31b-it'
 ];
 
-// ─── Reasoning subsystem ────────────────────────────────────────────────────
-// Owns: which chat_template_kwargs/top-level fields each backend model needs
-// to control thinking, and how to pull reasoning text back out of responses
-// that embed it inline vs. as a structured field.
-
-const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
-if (SHOW_REASONING) console.log('[CONFIG] Reasoning display: ENABLED');
-
-// ─── Reasoning subsystem notes ─────────────────────────────────────────────
-// Reasoning/thinking parameters vary by backend model and aren't part of the
-// OpenAI schema, so they can't just be forwarded as-is — getReasoningPayload()
-// below maps each backend model to its own request shape.
-//
-// Everything getReasoningPayload() returns is spread directly into the
-// top-level JSON body sent to NIM via axios. Do NOT wrap it in an
-// `extra_body` key — that's an openai-SDK-only convention, unwrapped
-// client-side by the official SDKs and merged into the outgoing JSON as
-// top-level fields. This proxy talks to NIM's raw REST endpoint via axios
-// directly, so a literal "extra_body" field is just silently ignored.
-// Confirmed against NVIDIA's own curl docs, which send chat_template_kwargs
-// directly at the top level.
-//
-// nemotron-3-ultra's `force_nonempty_content` flag is NOT a confirmed NVIDIA
-// parameter — left in as opt-in/best-effort since unrecognized
-// chat_template_kwargs are typically ignored by the backend rather than
-// causing a hard failure.
-//
-// nemotron-3-super and nemotron-3-ultra also expose a `low_effort: true`
-// chat_template_kwargs flag — a middle ground between full reasoning and off,
-// but a fixed tier, not a self-deciding mode. Reachable by sending
-// reasoning_effort: "low" on a request.
-//
-// MiniMax-M3 controls reasoning via chat_template_kwargs.thinking_mode:
-// "enabled" | "disabled" | "adaptive" (confirmed against NVIDIA's own NIM
-// API reference for this model). "adaptive" is the only genuinely
-// self-deciding reasoning mode in this proxy — the model chooses whether to
-// think per-turn — and is reachable by sending reasoning_effort: "adaptive".
-// M3 also emits its reasoning inline in content wrapped in
-// <mm:think>...</mm:think> — a different tag than the generic <think> used
-// by qwen/nemotron-super — so it needs its own entry in
-// CONTENT_DELIMITER_TAGS or the tags leak straight into content unparsed.
-//
-// google/gemma-4-31b-it needs TWO separate flags to actually see reasoning
-// output: chat_template_kwargs.enable_thinking turns thinking on, but the
-// `reasoning` field is only populated in the response if include_reasoning
-// is ALSO sent as true at the top level (confirmed against NVIDIA's VLM
-// NIM docs). Sending enable_thinking alone makes the model reason internally
-// with nothing to show for it.
-//
-// DeepSeek V4 Flash 0731 controls reasoning via chat_template_kwargs:
-// { thinking: bool, reasoning_effort: "low"|"high"|"max" } — confirmed
-// against NVIDIA's own published code sample for this exact model on
-// build.nvidia.com, which sends reasoning nested inside chat_template_kwargs
-// via extra_body, not as a bare top-level field. `thinking` is the on/off
-// switch; `reasoning_effort` only controls intensity once thinking is on.
-// (Previously this proxy sent a bare top-level reasoning_effort field here,
-// which NIM doesn't recognize for this model — that's why requests to
-// deepseek-v4-flash-0731 were failing outright and silently falling back to
-// FALLBACK_MODELS instead of ever reaching DeepSeek.)
-//
-// Reasoning output format: by default, reasoning is kept out of `content`
-// and returned in a structured `reasoning`/`reasoning_content` field.
-// Clients that expect legacy inline <thinking> tags baked into content can
-// opt in by sending the `x-reasoning-format: inline` header.
-
-// Backend models that embed reasoning inline in `content` via delimiter tags,
-// rather than returning it as a separate structured field. Mapped to their
-// specific tag pair so DelimiterParser knows what to look for.
-const CONTENT_DELIMITER_TAGS = {
-  'qwen/qwen3.5-397b-a17b': ['<think>', '</think>'],
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5': ['<think>', '</think>'],
-  // MiniMax-M3 uses its own namespaced tag, not the generic <think> one.
-  'minimaxai/minimax-m3': ['<mm:think>', '</mm:think>']
-};
-
-// Pure, stateful string parser for extracting reasoning blocks across chunks.
-class DelimiterParser {
-  constructor(openTag, closeTag) {
-    this.openTag = openTag;
-    this.closeTag = closeTag;
-    this.inThinking = false;
-    this.buffer = '';
-  }
-
-  processChunk(chunk) {
-    this.buffer += chunk;
-    let content = '';
-    let reasoning = '';
-
-    while (true) {
-      const targetTag = this.inThinking ? this.closeTag : this.openTag;
-      const tagIndex = this.buffer.indexOf(targetTag);
-
-      if (tagIndex !== -1) {
-        const textBefore = this.buffer.substring(0, tagIndex);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
-        }
-        this.inThinking = !this.inThinking;
-        this.buffer = this.buffer.substring(tagIndex + targetTag.length);
-      } else {
-        // Check for partial tag at the end
-        let partialLen = 0;
-        const maxLen = Math.min(this.buffer.length, targetTag.length - 1);
-        for (let i = maxLen; i > 0; i--) {
-          if (targetTag.startsWith(this.buffer.substring(this.buffer.length - i))) {
-            partialLen = i;
-            break;
-          }
-        }
-        const textBefore = this.buffer.substring(0, this.buffer.length - partialLen);
-        if (this.inThinking) {
-          reasoning += textBefore;
-        } else {
-          content += textBefore;
-        }
-        this.buffer = this.buffer.substring(this.buffer.length - partialLen);
-        break;
-      }
-    }
-
-    return { content, reasoning };
-  }
-
-  flush() {
-    let content = '';
-    let reasoning = '';
-    if (this.buffer) {
-      if (this.inThinking) {
-        reasoning += this.buffer;
-      } else {
-        content += this.buffer;
-      }
-      this.buffer = '';
-    }
-    return { content, reasoning };
-  }
-}
-
-// Normalizes structured reasoning fields and extracts content delimiters.
-class StreamNormalizer {
-  constructor(model) {
-    this.model = model;
-    this.parser = null;
-    // ONLY use content delimiters for models that embed reasoning in content
-    const tags = CONTENT_DELIMITER_TAGS[model];
-    if (tags) {
-      this.parser = new DelimiterParser(tags[0], tags[1]);
-    }
-    // Models like Gemma 4, DeepSeek, GPT-OSS use structured fields and are NOT parsed here.
-  }
-
-  processDelta(delta) {
-    const normalizedDelta = { ...delta };
-    let reasoning = normalizedDelta.reasoning || normalizedDelta.reasoning_content || '';
-    let content = normalizedDelta.content || '';
-
-    // Priority: Structured reasoning > Content delimiters
-    if (!reasoning && content && this.parser) {
-      const parsed = this.parser.processChunk(content);
-      reasoning = parsed.reasoning;
-      content = parsed.content;
-    }
-
-    if (content) normalizedDelta.content = content;
-    else delete normalizedDelta.content;
-
-    if (reasoning) normalizedDelta.reasoning = reasoning;
-    else delete normalizedDelta.reasoning;
-
-    delete normalizedDelta.reasoning_content;
-    return normalizedDelta;
-  }
-
-  flush() {
-    if (!this.parser) return { content: '', reasoning: '' };
-    return this.parser.flush();
-  }
-}
-
-function normalizeNonStreamChoice(choice, model) {
-  if (!choice) return choice;
-  const message = choice.message || {};
-  let reasoning = message.reasoning || message.reasoning_content || '';
-  let content = message.content || '';
-
-  if (!reasoning && content) {
-    let parser = null;
-    const tags = CONTENT_DELIMITER_TAGS[model];
-    if (tags) {
-      parser = new DelimiterParser(tags[0], tags[1]);
-    }
-    if (parser) {
-      const parsed = parser.processChunk(content);
-      const flushed = parser.flush();
-      content = (parsed.content || '') + (flushed.content || '');
-      reasoning = (parsed.reasoning || '') + (flushed.reasoning || '');
-    }
-  }
-
-  const newMessage = { ...message };
-  if (content) newMessage.content = content;
-  if (reasoning) newMessage.reasoning = reasoning;
-  delete newMessage.reasoning_content;
-
-  return { ...choice, message: newMessage };
-}
-
-// Valid reasoning_effort values per backend model, where the backend enforces
-// an enum. Anything outside this set is dropped rather than forwarded, so a
-// bad client value fails fast in proxy logs instead of as an opaque upstream 400.
-const REASONING_EFFORT_ENUMS = {
-  'openai/gpt-oss-120b': ['low', 'medium', 'high'],
-  'openai/gpt-oss-20b': ['low', 'medium', 'high'],
-  'mistralai/mistral-medium-3.5-128b': ['high', 'none'],
-  'mistralai/mistral-small-4-119b-2603': ['high', 'none'],
-
-  // Confirmed against NVIDIA's own build.nvidia.com code sample for this
-  // model: reasoning_effort lives inside chat_template_kwargs (see
-  // getReasoningPayload below), and only "low"/"high"/"max" are valid —
-  // there's no "none" value; thinking is toggled off separately via
-  // chat_template_kwargs.thinking: false.
-  'deepseek-ai/deepseek-v4-flash-0731': ['low', 'high', 'max'],
-
-  // Not a true adaptive/effort scale — these two only expose a single extra
-  // "low_effort" middle tier between full reasoning and off.
-  'nvidia/nemotron-3-super-120b-a12b': ['low'],
-  'nvidia/nemotron-3-ultra-550b-a55b': ['low'],
-
-  // MiniMax-M3's only non-binary option: let the model decide per-turn.
-  'minimaxai/minimax-m3': ['adaptive']
-};
-
-function validReasoningEffort(model, effort) {
-  const allowed = REASONING_EFFORT_ENUMS[model];
-  if (!allowed) return effort; // no enum enforced for this model, pass through
-  if (allowed.includes(effort)) return effort;
-  if (effort) {
-    console.warn(`[REASONING] Dropping invalid reasoning_effort "${effort}" for ${model} (allowed: ${allowed.join(', ')})`);
-  }
-  return undefined;
-}
-
-// Pure function returning model-specific reasoning request payloads.
-// IMPORTANT: everything returned here gets spread DIRECTLY into the top-level
-// JSON body sent to NIM via axios. Do NOT wrap anything in an `extra_body` key —
-// see the reasoning subsystem notes above.
-//
-// UNIVERSAL CLIENT OVERRIDE: reasoning_effort: "off" / "on" forces thinking
-// off/on for that one request, regardless of the server's ENABLE_THINKING_MODE
-// default. This exists because, before it was added, the on/off decision for
-// 7 of the 9 reasoning models below (everything except mistral's accidental
-// "none" and M3's "adaptive") was wired to the server env var ONLY — a
-// client-side reasoning toggle in any chat UI had no field it could send that
-// actually changed anything for those models. "off"/"on" are stripped before
-// running the model-specific effort enum check below, so they never collide
-// with a real per-model value like "high" or "adaptive".
-//
-// Caveat: gpt-oss models structurally always emit a reasoning channel — this
-// can reduce them to their baseline default but can't literally eliminate
-// reasoning tokens the way it can for every other model here.
-function getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools) {
-  if (clientReasoningEffort === 'off') enableThinking = false;
-  else if (clientReasoningEffort === 'on') enableThinking = true;
-
-  const rawEffort = (clientReasoningEffort === 'off' || clientReasoningEffort === 'on')
-    ? undefined
-    : clientReasoningEffort;
-  const effort = validReasoningEffort(model, rawEffort);
-
-  switch (model) {
-    case 'nvidia/nemotron-3-super-120b-a12b': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { enable_thinking: true } };
-      if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      return payload;
-    }
-
-    case 'nvidia/nemotron-3-ultra-550b-a55b': {
-      if (!enableThinking) return {};
-      const payload = { chat_template_kwargs: { enable_thinking: true } };
-      if (effort === 'low') payload.chat_template_kwargs.low_effort = true;
-      // Unverified param — see header comment. Left as opt-in best-effort.
-      if (hasTools) payload.chat_template_kwargs.force_nonempty_content = true;
-      return payload;
-    }
-
-    case 'qwen/qwen3.5-397b-a17b': {
-      // Model appears to default to thinking-on in its chat template. Only send
-      // a field when the caller explicitly wants thinking OFF; otherwise let the
-      // <think> delimiter parser handle whatever the model does natively.
-      if (enableThinking) return {};
-      return { chat_template_kwargs: { enable_thinking: false } };
-    }
-
-    case 'deepseek-ai/deepseek-v4-flash-0731': {
-      // Confirmed against NVIDIA's own build.nvidia.com code sample for this
-      // exact model: reasoning is controlled via chat_template_kwargs —
-      // { thinking: bool, reasoning_effort: "low"|"high"|"max" } — NOT a
-      // bare top-level reasoning_effort field. The sample sends
-      // extra_body={"chat_template_kwargs":{"thinking":True,"reasoning_effort":"high"}},
-      // which the openai SDK unwraps into exactly those two fields at the
-      // top level of the JSON body (see extra_body note at the top of this
-      // file) — this is what we build by hand here.
-      if (!enableThinking) {
-        return { chat_template_kwargs: { thinking: false } };
-      }
-
-      return {
-        chat_template_kwargs: {
-          thinking: true,
-          reasoning_effort: effort || 'high'
-        }
-      };
-    }
-
-    case 'openai/gpt-oss-120b':
-    case 'openai/gpt-oss-20b': {
-      if (effort) return { reasoning_effort: effort };
-      if (enableThinking) return { reasoning_effort: 'high' };
-      return {};
-    }
-
-    case 'mistralai/mistral-medium-3.5-128b':
-    case 'mistralai/mistral-small-4-119b-2603': {
-      if (effort) return { reasoning_effort: effort };
-      if (enableThinking) return { reasoning_effort: 'high' };
-      return {};
-    }
-
-    case 'google/gemma-4-31b-it': {
-      if (!enableThinking) return {};
-      // enable_thinking only makes the model reason internally — it does NOT
-      // by itself put that reasoning in the response. NVIDIA's own VLM docs
-      // require a separate top-level include_reasoning flag to actually
-      // return the `reasoning` field; without it we may be paying the
-      // latency/token cost of thinking and never seeing the output. Match it
-      // to SHOW_REASONING so behavior is explicit instead of relying on
-      // whatever include_reasoning defaults to upstream.
-      return {
-        chat_template_kwargs: { enable_thinking: true },
-        include_reasoning: SHOW_REASONING
-      };
-    }
-
-    case 'stepfun-ai/step-3.7-flash': {
-      if (enableThinking) return {};
-      return { chat_template_kwargs: { thinking: false } };
-    }
-
-    case 'minimaxai/minimax-m3': {
-      // Per NVIDIA's own NIM API reference, MiniMax-M3 controls reasoning via
-      // chat_template_kwargs.thinking_mode: "enabled" | "disabled" | "adaptive".
-      // "adaptive" lets the model decide per-turn whether to think — the only
-      // genuinely self-deciding reasoning mode across every model in this
-      // proxy. Send reasoning_effort: "adaptive" on a request to use it;
-      // otherwise this falls back to the standard on/off toggle like every
-      // other model here.
-      const thinkingMode = effort === 'adaptive'
-        ? 'adaptive'
-        : (enableThinking ? 'enabled' : 'disabled');
-      return { chat_template_kwargs: { thinking_mode: thinkingMode } };
-    }
-
-    default:
-      // Default reasoning models (Kimi, MiniMax, etc.) or non-reasoning models
-      return {};
-  }
-}
-
-// ─── Tool-call recovery subsystem ──────────────────────────────────────────
-// Some backend models intermittently fail to convert their native tool-call
-// output into NIM's structured `tool_calls` field and instead dump the raw
-// Hermes-style tag straight into `content` as plain text:
-//   <tool_call>
-//   {"name": "...", "arguments": {...}}
-//   </tool_call>
-//
-// This is a CONFIRMED upstream bug, not something wrong with this proxy's
-// request shape:
-//   - vllm-project/vllm#48095 reproduces this exact failure with GLM-5.2
-//     (vLLM's own `glm47` tool-call parser fails and the call is written
-//     unparsed into content), specifically under tool_choice: "required".
-//   - zai-org/GLM-5#15 and two independent OpenCode bug reports show the
-//     same GLM-5/5.2-via-NIM leak, intermittent and worse on long contexts
-//     with many tool calls in a session.
-//   - zed-industries/zed#55884 reproduces the identical failure mode with
-//     nvidia/nemotron-3-super-120b-a12b via integrate.api.nvidia.com ("the
-//     first few tool calls go correctly... later, the tool calling code is
-//     seen in output directly") — so this isn't GLM-specific, it can happen
-//     with any model in MODEL_MAPPING/FALLBACK_MODELS.
-//
-// Because it's an intermittent upstream parser failure rather than a model
-// that flatly lacks tool-call support, it can't be fixed by routing around
-// a specific model — it has to be caught and repaired wherever it happens.
-// This recovery layer runs unconditionally (streaming and non-streaming) and
-// is a no-op with negligible overhead when the tag never appears.
-
-const TOOL_CALL_OPEN = '<tool_call>';
-const TOOL_CALL_CLOSE = '</tool_call>';
-
-function generateToolCallId() {
-  return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-}
-
-// Non-streaming: extracts every <tool_call>{...}</tool_call> block from a
-// complete content string. Returns { content, toolCalls } — content has the
-// recovered blocks stripped out, toolCalls is an array of OpenAI-shaped
-// tool_calls objects (possibly empty).
-//
-// Malformed JSON inside a tag (also a documented GLM-5.2 symptom — truncated
-// args, missing closing brace, per the zai-org/GLM-5#15 reports) is left in
-// place rather than silently dropped, so worst case the raw tag still reaches
-// the client instead of vanishing without a trace.
-function extractLeakedToolCalls(content) {
-  if (!content || !content.includes(TOOL_CALL_OPEN)) {
-    return { content, toolCalls: [] };
-  }
-
-  const toolCalls = [];
-  let result = '';
-  let cursor = 0;
-
-  while (true) {
-    const openIdx = content.indexOf(TOOL_CALL_OPEN, cursor);
-    if (openIdx === -1) {
-      result += content.slice(cursor);
-      break;
-    }
-    const closeIdx = content.indexOf(TOOL_CALL_CLOSE, openIdx);
-    if (closeIdx === -1) {
-      // Unterminated tag (e.g. truncated at max_tokens) — leave it as-is
-      // rather than guess at a repair.
-      result += content.slice(cursor);
-      break;
-    }
-
-    result += content.slice(cursor, openIdx);
-    const inner = content.slice(openIdx + TOOL_CALL_OPEN.length, closeIdx).trim();
-
-    try {
-      const parsed = JSON.parse(inner);
-      if (parsed && typeof parsed.name === 'string') {
-        toolCalls.push({
-          id: generateToolCallId(),
-          type: 'function',
-          function: {
-            name: parsed.name,
-            arguments: JSON.stringify(parsed.arguments ?? {})
-          }
-        });
-      } else {
-        // Well-formed JSON but not the shape we expect — keep it visible.
-        result += content.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
-      }
-    } catch {
-      console.warn('[TOOL_CALL_RECOVERY] Malformed JSON inside <tool_call> tag, leaving raw:', inner.slice(0, 200));
-      result += content.slice(openIdx, closeIdx + TOOL_CALL_CLOSE.length);
-    }
-
-    cursor = closeIdx + TOOL_CALL_CLOSE.length;
-  }
-
-  return { content: result, toolCalls };
-}
-
-// Streaming: stateful, cross-chunk recovery for the same leak. Built on top
-// of DelimiterParser — the same battle-tested cross-chunk tag-splitting
-// logic already used above for <think>/<mm:think> — rather than a second
-// bespoke parser, since a <tool_call> tag can just as easily be split across
-// SSE chunk boundaries as a <think> tag can.
-class ToolCallStreamRecovery {
-  constructor() {
-    this.parser = new DelimiterParser(TOOL_CALL_OPEN, TOOL_CALL_CLOSE);
-    this.pending = '';
-    this.toolCallIndex = 0;
-  }
-
-  // text: already-normalized content for this chunk (post reasoning-split).
-  // Returns { content, toolCallDelta } — content is safe to forward to the
-  // client as-is, toolCallDelta is a ready OpenAI tool_calls delta or null.
-  process(text) {
-    const { content, reasoning } = this.parser.processChunk(text);
-    let outContent = content;
-
-    if (reasoning) this.pending += reasoning;
-
-    // pending non-empty + parser no longer inside the tag == a close tag was
-    // just resolved in this call (pending is always cleared immediately
-    // below, so this state can only be freshly true).
-    if (this.pending && !this.parser.inThinking) {
-      const inner = this.pending.trim();
-      this.pending = '';
-      try {
-        const parsed = JSON.parse(inner);
-        if (parsed && typeof parsed.name === 'string') {
-          return {
-            content: outContent,
-            toolCallDelta: {
-              index: this.toolCallIndex++,
-              id: generateToolCallId(),
-              type: 'function',
-              function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments ?? {}) }
-            }
-          };
-        }
-        outContent = TOOL_CALL_OPEN + inner + TOOL_CALL_CLOSE + outContent;
-      } catch {
-        console.warn('[TOOL_CALL_RECOVERY] Malformed JSON inside streamed <tool_call> tag, leaving raw:', inner.slice(0, 200));
-        outContent = TOOL_CALL_OPEN + inner + TOOL_CALL_CLOSE + outContent;
-      }
-    }
-
-    return { content: outContent, toolCallDelta: null };
-  }
-
-  // Stream ended while still mid-tag (cut off before the closing tag
-  // arrived, e.g. hit max_tokens) — return the raw partial buffer as text
-  // instead of silently dropping it.
-  flush() {
-    const flushed = this.parser.flush();
-    let leftover = flushed.content || '';
-    const tailInner = this.pending + (flushed.reasoning || '');
-    if (tailInner) {
-      leftover += TOOL_CALL_OPEN + tailInner;
-    }
-    this.pending = '';
-    return leftover;
-  }
-}
-
 // ─── Middleware ─────────────────────────────────────────────────────────────
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// Set high since some long-context models in this mapping support up to
+// ~1M tokens, and a realistic conversation history can approach that size
+// once JSON-encoded. Note that some serverless platforms enforce their own
+// hard request-body cap at the infrastructure level regardless of this
+// setting (e.g. Vercel caps at 4.5 MB and isn't configurable from app code)
+// — check your platform's limits if you expect genuinely large payloads.
+app.use(express.json({ limit: '50mb' }));
 
 // Catch malformed JSON bodies so clients get a clean OpenAI-style error
 // instead of Express's default HTML error page. Without this, a broken
@@ -639,12 +127,17 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// Extract token AFTER "Bearer " prefix, compare only the token
+// Extract token AFTER "Bearer " prefix, compare only the token. Uses
+// startsWith + slice rather than split(' ') — split produces the wrong
+// array length (and silently rejects an otherwise-valid header) on anything
+// but exactly one space, e.g. "Bearer  <token>" with a doubled space or
+// trailing whitespace on the token itself.
 function extractBearerToken(authHeader) {
   if (!authHeader || typeof authHeader !== 'string') return null;
-  const parts = authHeader.trim().split(' ');
-  if (parts.length !== 2 || parts[0] !== 'Bearer') return null;
-  return parts[1];
+  const trimmed = authHeader.trim();
+  if (!trimmed.startsWith('Bearer ')) return null;
+  const token = trimmed.slice('Bearer '.length).trim();
+  return token || null;
 }
 
 function safeTimingEqual(a, b) {
@@ -778,13 +271,16 @@ function safeWrite(res, data) {
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
   let lastError = null;
+  const timeoutMs = resolveEffectiveThinking(enableThinking, clientReasoningEffort)
+    ? REASONING_REQUEST_TIMEOUT_MS
+    : REQUEST_TIMEOUT_MS;
 
   for (const model of models) {
     const reasoningPayload = getReasoningPayload(model, enableThinking, clientReasoningEffort, hasTools);
     const fullRequest = { ...baseRequest, model, ...reasoningPayload };
 
     if (DEBUG_MODE) {
-      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload));
+      console.log(`[DEBUG] Attempting ${model} with reasoning payload:`, JSON.stringify(reasoningPayload), `(timeout: ${timeoutMs}ms)`);
     }
 
     try {
@@ -797,7 +293,7 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
             'Content-Type': 'application/json'
           },
           responseType: baseRequest.stream ? 'stream' : 'json',
-          timeout: REQUEST_TIMEOUT_MS
+          timeout: timeoutMs
         }
       );
       return { response: res, model };
@@ -808,10 +304,8 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
         err.response?.status,
         err.response?.data?.error?.message || err.message
       );
-      // The full request body + full upstream error, not just the one-line
-      // message above. This is exactly what would've surfaced the
-      // deepseek-v4-flash-0731 bug in one request instead of requiring a
-      // manual trawl through NVIDIA's docs to spot a bad payload shape.
+      // Full request body + full upstream error, not just the one-line
+      // message above — useful for spotting a bad payload shape quickly.
       if (DEBUG_MODE) {
         console.log(`[DEBUG] Full request body sent to ${model}:`, JSON.stringify(fullRequest));
         console.log(`[DEBUG] Full upstream error response:`, JSON.stringify(err.response?.data || null));
@@ -824,18 +318,18 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
 // ─── Routes ────────────────────────────────────────────────────────────────
 
-// People keep pasting the base deployment URL into a browser to "check if
-// it's up" and getting a raw 403 from the auth middleware below, since
-// there's nothing registered at "/" and a browser sends no Authorization
-// header. That reads as "the proxy is down" when it isn't — this route
-// exists purely to stop that specific class of help request.
+// Without this route, visiting the base URL in a browser hits the auth
+// middleware below (which a browser can't pass, since it sends no
+// Authorization header) and returns a bare 403 — easy to mistake for "the
+// proxy is down." This route just confirms it's up and points to the real
+// endpoints.
 app.get('/', (req, res) => {
   res.type('html').send(`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NIM Proxy — running</title>
+<title>nim-to-openai-proxy</title>
 <style>
   body {
     margin: 0;
@@ -857,26 +351,28 @@ app.get('/', (req, res) => {
 </head>
 <body>
   <div class="card">
-    <h1>✅ This is working — it's just not a website</h1>
-    <p>This is an OpenAI-compatible API proxy, not something you browse. Nothing is broken. There's just nothing to show at the root path.</p>
-    <p>If someone sent you this link to check whether it's up: yes, it's up.</p>
-    <p>To actually use it, point an OpenAI-compatible client at <code>/v1/chat/completions</code> with an <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
-    <p>Quick status check (no token needed): <code>/health</code></p>
-    <p><a href="https://github.com/skywalker14017/nim-to-openai-proxy" style="color:#7ee787;">Full docs / setup on GitHub →</a></p>
+    <svg width="44" height="44" viewBox="0 0 24 24" fill="none" style="margin: 0 auto 14px; display: block;">
+      <circle cx="12" cy="12" r="11" stroke="#7ee787" stroke-width="1.5"/>
+      <path d="M7 12.5l3 3 6-6.5" stroke="#7ee787" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    </svg>
+    <h1>it's up.</h1>
+    <p>this proxies OpenAI-format chat requests to NVIDIA NIM. point any OpenAI-compatible client at it, pick a model with a plain alias (<code>gpt-4</code>, <code>mistral</code>, etc), and it handles model fallback, streaming, and each backend's own reasoning/thinking quirks for you.</p>
+    <p>it's an API, not a website: nothing lives at this root path.</p>
+    <p>send requests to <code>/v1/chat/completions</code> with an <code>Authorization: Bearer &lt;token&gt;</code> header.</p>
+    <p>status check, no token needed: <code>/health</code></p>
+    <p>bugs / questions: <a href="https://github.com/skywalker14017/nim-to-openai-proxy" style="color:#7ee787;">open an issue on GitHub</a> (docs are there too), or hit me up on Discord (i'll be faster there): <code>skywalker_1401</code></p>
   </div>
 </body>
 </html>`);
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.5.0' });
+  res.json({ status: 'ok', version: '2.6.0' });
 });
 
 app.get('/v1/models', async (req, res) => {
-  // Default path: unchanged from before, no network round trip, same exact
-  // shape. Kept fast and static so anything hitting this route unconditionally
-  // (most OpenAI-compatible clients ping it on startup) isn't affected by the
-  // live check's latency or failure modes.
+  // Default: static list, no network round trip. Kept fast so clients that
+  // ping this route on startup aren't affected by the live check's latency.
   if (req.query.live !== 'true') {
     return res.json({
       object: 'list',
@@ -894,12 +390,9 @@ app.get('/v1/models', async (req, res) => {
   }
 
   // ?live=true cross-checks every alias's backend model ID against NIM's
-  // actual current catalog right now, on demand — instead of only at startup
-  // via validateModels(), or getting quietly absorbed by FALLBACK_MODELS the
-  // next time someone actually sends a chat request. This is exactly the
-  // check that would've caught the deepseek-v4-flash-0731 payload issue's
-  // sibling problem (a backend ID silently falling out of the catalog, e.g.
-  // the deepseek-v4-pro removal) immediately instead of by accident.
+  // current catalog on demand, instead of only at startup (validateModels())
+  // or discovering a deprecated model ID by accident on the next chat
+  // request, when it would silently fall through to FALLBACK_MODELS.
   try {
     const availableModels = await fetchLiveModelIds();
     const data = Object.entries(MODEL_MAPPING).map(([id, backend]) => ({
@@ -936,15 +429,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   let upstreamStream = null;
 
   try {
-    const {
-      model,
-      messages,
-      temperature,
-      max_tokens,
-      stream,
-      tools,
-      tool_choice
-    } = req.body;
+    const { model, max_tokens, temperature, stream, reasoning_effort } = req.body;
 
     let primaryModel = MODEL_MAPPING[model];
     if (!primaryModel) {
@@ -957,24 +442,28 @@ app.post('/v1/chat/completions', async (req, res) => {
     // twice before actually diversifying.
     const modelChain = [...new Set([primaryModel, ...FALLBACK_MODELS])];
 
+    // Forward every field the client sent (top_p, stop, seed, tools,
+    // tool_choice, response_format, etc.) rather than a narrow whitelist, so
+    // nothing a client relies on silently vanishes. `model` and
+    // `reasoning_effort` are excluded on purpose: model gets replaced
+    // per-attempt below, and reasoning_effort is translated into the correct
+    // per-model shape by getReasoningPayload() — forwarding the raw value too
+    // would leak a redundant/conflicting field alongside the translated one.
+    const { model: _droppedModel, reasoning_effort: _droppedReasoningEffort, ...forwardedFields } = req.body;
+
     const baseRequest = {
-      messages,
+      ...forwardedFields,
       temperature: temperature ?? 0.7,
       max_tokens: Math.min(max_tokens ?? 2048, MAX_TOKENS_LIMIT),
-      stream: stream || false,
-      // Forward tool-calling fields as-is. Without this, clients using
-      // function/tool calling silently get a plain chat completion back —
-      // NIM never sees the tool definitions, so it never returns tool_calls.
-      ...(tools && { tools }),
-      ...(tool_choice && { tool_choice })
+      stream: stream || false
     };
 
     const { response, model: usedModel } = await callWithFallback(
       baseRequest,
       modelChain,
       ENABLE_THINKING_MODE,
-      req.body.reasoning_effort,
-      !!tools
+      reasoning_effort,
+      !!req.body.tools
     );
 
     upstreamStream = response.data;
@@ -994,9 +483,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       let doneSent = false;
       let cleanedUp = false;
       const normalizer = new StreamNormalizer(usedModel);
-      // See "Tool-call recovery subsystem" above — catches models (GLM-5.2,
-      // nemotron-3-super confirmed) that leak tool calls into content as a
-      // raw <tool_call> tag instead of NIM's structured tool_calls field.
+      // See tools.js — catches models (GLM-5.2, nemotron-3-super confirmed)
+      // that leak tool calls into content as a raw <tool_call> tag instead
+      // of NIM's structured tool_calls field.
       const toolRecovery = new ToolCallStreamRecovery();
 
       const cleanup = () => {
@@ -1055,13 +544,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             // Recover tool calls the backend leaked into content as a raw
             // <tool_call> tag instead of a structured field (confirmed
-            // upstream bug — see subsystem notes above). Must run on the
+            // upstream bug — see tools.js). Must run on the
             // final clientContent (post reasoning-split, post inline-tag
             // formatting) since that's the actual text stream being built.
-            const { content: recoveredContent, toolCallDelta } = toolRecovery.process(clientContent);
+            const { content: recoveredContent, toolCallDeltas } = toolRecovery.process(clientContent);
             clientContent = recoveredContent;
-            if (toolCallDelta) {
-              delta.tool_calls = [toolCallDelta];
+            if (toolCallDeltas.length > 0) {
+              delta.tool_calls = toolCallDeltas;
               // Force the signal even if upstream's own finish_reason on this
               // chunk was null/'stop' — a recovered tool call means the
               // model's actual intent was a tool_calls turn, and
@@ -1244,7 +733,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
           // Recover tool calls the backend leaked into content as a raw
           // <tool_call> tag instead of NIM's structured tool_calls field
-          // (confirmed upstream bug — see subsystem notes above).
+          // (confirmed upstream bug — see tools.js).
           const { content: cleanedContent, toolCalls: recoveredToolCalls } = extractLeakedToolCalls(content);
           content = cleanedContent;
 
@@ -1352,4 +841,3 @@ app.listen(PORT, () => {
     console.error('[VALIDATION] Startup check failed:', err.message);
   });
 });
-
