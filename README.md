@@ -1,6 +1,5 @@
 ### Announcement 
-Due to personal health reasons, I will no longer be able to maintain this project. Check Skywalker's fork for more recent updates, though i will work with him to merge updates to this repo every now and then.
-Here is the link to his fork: https://github.com/skywalker14017/nim-to-openai-proxy
+Due to personal health reasons, Jontte (original owner) will no longer be able to maintain this project. I'll try to maintain this for the time being!
 
 ### If you forked before June 7, 2026, please pull the latest version — previous versions had an auth bypass and startup DDoS vulnerability.
 
@@ -139,7 +138,7 @@ When reporting bugs, include:
 - Your deployment platform (Railway, Render, etc.)
 
 ## Contact
-Need to reach out faster? Add Skywalker on Discord, his username is - `Skywalker_1401`. He'll respond faster on Discord than Github.
+Need to reach out faster? Add me on Discord, his username is - `Skywalker_1401`. I'll respond faster on Discord than Github.
 
 ## Disclaimer
 
