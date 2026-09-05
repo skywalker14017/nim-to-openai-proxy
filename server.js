@@ -69,9 +69,9 @@ validateConfig();
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/nemotron-3-super-120b-a12b',
   'gpt-4': 'nvidia/nemotron-3-ultra-550b-a55b',
-  'gpt-3.5': 'nvidia/nemotron-3-nano-30b-a3b', // was qwen/qwen3.5-397b-a17b
+  'gpt-3.5': 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning', // was qwen/qwen3.5-397b-a17b
   'gpt-4-turbo': 'moonshotai/kimi-k3',
-  'claude-3-opus': 'openai/gpt-oss-120b',
+  'claude-3-opus': 'google/diffusiongemma-26b-a4b-it',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'nvidia/llama-3.1-nemotron-70b-instruct', // was nvidia/llama-3.3-nemotron-super-49b-v1.5
   'gemini-turbo': 'nvidia/llama3-chatqa-1.5-70b', // was meta/llama-3.3-70b-instruct
@@ -94,7 +94,7 @@ const DEFAULT_MODEL = 'google/gemma-4-31b-it';
 
 // Ordered by observed reliability/speed — an early failing model delays every fallback behind it.
 const FALLBACK_MODELS = [
-  'openai/gpt-oss-20b',
+  'google/diffusiongemma-26b-a4b-it',
   'google/gemma-4-31b-it',
   'mistralai/mistral-nemotron',
   'nvidia/nemotron-3-super-120b-a12b'

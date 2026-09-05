@@ -39,10 +39,10 @@ Node.js 24+, a NVAPI/Nim API key, a deployment platform (though if you follow th
 | `mistral-pro` | `mistralai/mistral-7b-instruct-v0.3` | Lightweight scenes | Very Fast | Low |
 | `mistral-fast` | `nvidia/mistral-nemo-minitron-8b-8k-instruct` | Fast, compact Mistral | Very Fast | Low |
 | `mistral-nemo` | `mistralai/mistral-nemotron` | Casual/anime RP | Fast | Low |
-| `claude-3-opus` | `openai/gpt-oss-120b` | Alternative to Chinese models | Medium | Low-Medium |
+| `claude-3-opus` | `google/diffusiongemma-26b-a4b-it` | Alternative to Chinese models | Extremely fast | Low-Medium |
 | `claude-3-sonnet` | `openai/gpt-oss-20b` | Fast, distinct voice | Fast | Low-Medium |
 | `gpt-3.5-turbo` | `nvidia/nemotron-3-super-120b-a12b` | Lightweight tasks | Fast | Low |
-| `gpt-3.5` | `nvidia/nemotron-3-nano-30b-a3b` | Nvidia nano fallback | Fast | Low |
+| `gpt-3.5` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | Nvidia nano fallback | Fast | Low |
 | `google-light` | `google/gemma-4-31b-it` | Short scenes, fast | Fast | Low-Medium |
 | `google-lighter` | `poolside/laguna-xs-2.1` | Coding | Fast | Unknown (to me) |
 | `google-lightest` | `meta/muse-glimmer-30b` | Coding & Agentic work | Fast | Unknown (to me) |
@@ -63,7 +63,7 @@ Node.js 24+, a NVAPI/Nim API key, a deployment platform (though if you follow th
 If your requested model fails, the proxy automatically tries:
 1. Requested model
 2. `google/gemma-4-31b-it`
-3. `openai/gpt-oss-20b`
+3. `google/diffusiongemma-26b-a4b-it`
 4. `mistralai/mistral-nemotron`
 5. `nvidia/nemotron-3-super-120b-a12b`
 
