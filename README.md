@@ -106,7 +106,7 @@ Set to `false` or remove to disable. Changes apply without redeploying.
 | Problem | Likely Cause | Fix |
 |---|---|---|
 | "All models failed" error | NIM API key invalid or expired | Regenerate key at build.nvidia.com |
-| Very slow responses | Using `gpt-4o`, `gpt-4-turbo`, or other Chinese-hosted models during peak hours | Switch to `gemini-pro`, `mistral-turbo`, or `gpt-3.5o` |
+| Very slow responses | Using `gpt-4o`, `gpt-4-turbo`, or other Chinese-hosted models during peak hours | Switch to `gemini-pro`, `mistral-turbo`, `claude-3-opus`, or `gpt-3.5o` |
 | Filter interrupts RP | Using Chinese-hosted model for mature content | Use `mistral`, `gemini-pro`, or `claude-3-opus` |
 | 404 on `/v1/chat/completions` | Auth mismatch | Verify `CLIENT_AUTH_KEY` matches between Railway and client |
 | "Failed to fetch (unk)" / "A network error occurred" | JanitorAI cached old proxy config after changing URL or model | **Reload the page** — changes don't apply until refresh |
@@ -138,8 +138,8 @@ When reporting bugs, include:
 - Your deployment platform (Railway, Render, etc.)
 
 ## Contact
-Need to reach out faster? Add me on Discord, his username is - `Skywalker_1401`. I'll respond faster on Discord than Github.
+Need to reach out faster? Add me on Discord, my username is - `Skywalker_1401`. I'll respond faster on Discord than Github.
 
 ## Disclaimer
 
-I am not a professional developer.
+I am not a professional developer. 
