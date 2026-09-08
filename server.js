@@ -93,13 +93,14 @@ const MODEL_MAPPING = {
   'm2.7': 'minimaxai/minimax-m2.7',
   'm3': 'minimaxai/minimax-m3',
   'step-3.5-flash': 'stepfun-ai/step-3.5-flash',
-  'step-3.7-flash': 'stepfun-ai/step-3.7-flash'
+  'step-3.7-flash': 'stepfun-ai/step-3.7-flash',
+  'kimi-k3': 'moonshotai/kimi-k3',
 };
 
 const FALLBACK_MODELS = [
-  'mistralai/mistral-medium-3.5-128b',
-  'mistralai/mistral-small-4-119b-2603',
-  'nvidia/llama-3.3-nemotron-super-49b-v1.5'
+  'nvidia/nemotron-3-super-120b-a12b',
+  'openai/gpt-oss-20b',
+  'moonshotai/kimi-k3'
 ];
 
 // ─── Reasoning Subsystem ─────────────────────────────────────────────────────
@@ -491,9 +492,9 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
       lastError = err;
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
-        err.response?.status,
-        err.response?.data?.error?.message || err.message
-      );
+          err.response?.status,
+          JSON.stringify(err.response?.data) || err.message
+     );
     }
   }
 
@@ -531,7 +532,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream
     } = req.body;
 
-    const primaryModel = MODEL_MAPPING[model] || 'nvidia/llama-3.3-nemotron-super-49b-v1.5';
+    
+    const primaryModel = MODEL_MAPPING[model] || 'nvidia/nemotron-3-super-120b-a12b';
     const modelChain = [primaryModel, ...FALLBACK_MODELS];
 
     const baseRequest = {
