@@ -464,6 +464,59 @@ function safeWrite(res, data) {
   return false;
 }
 
+// ─── Helper: Safe Error Body Extraction ────────────────────────────────────
+// IMPORTANT: when a request is made with `responseType: 'stream'` (i.e. the
+// client sent stream: true), axios error responses ALSO come back as a
+// Readable stream in err.response.data — NOT parsed JSON. A raw Node stream
+// holds a live reference to its underlying TLSSocket/HTTPParser, and those
+// objects reference each other in a cycle. Calling JSON.stringify on that
+// stream throws "Converting circular structure to JSON" and swallows the
+// real NIM error message. This helper detects that case and drains the
+// stream safely instead of stringifying it directly.
+
+function isStream(obj) {
+  return !!obj && typeof obj.pipe === 'function' && typeof obj.on === 'function';
+}
+
+async function extractErrorBody(err) {
+  const data = err?.response?.data;
+  if (!data) return err?.message || 'Unknown error';
+
+  if (isStream(data)) {
+    try {
+      const chunks = [];
+      const text = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(''), 2000); // don't hang forever
+        data.on('data', (c) => chunks.push(c));
+        data.on('end', () => {
+          clearTimeout(timer);
+          resolve(Buffer.concat(chunks).toString('utf8'));
+        });
+        data.on('error', (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+      });
+      try {
+        return JSON.stringify(JSON.parse(text));
+      } catch {
+        return text || err.message;
+      }
+    } catch (readErr) {
+      return `[could not read stream error body: ${readErr.message}]`;
+    }
+  }
+
+  if (Buffer.isBuffer(data)) return data.toString('utf8');
+  if (typeof data === 'string') return data;
+
+  try {
+    return JSON.stringify(data);
+  } catch {
+    return '[unserializable error body]';
+  }
+}
+
 // ─── Helper: Fallback Chain ─────────────────────────────────────────────────
 
 async function callWithFallback(baseRequest, models, enableThinking, clientReasoningEffort, hasTools) {
@@ -490,11 +543,12 @@ async function callWithFallback(baseRequest, models, enableThinking, clientReaso
 
     } catch (err) {
       lastError = err;
+      const bodyText = await extractErrorBody(err);
       console.warn(
         `[FALLBACK] Model failed: ${model}`,
-          err.response?.status,
-          JSON.stringify(err.response?.data) || err.message
-     );
+        err.response?.status,
+        bodyText
+      );
     }
   }
 
@@ -798,8 +852,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
+    const bodyText = await extractErrorBody(error);
     console.error('[PROXY] Fatal error:', error.message);
-    console.error('[PROXY] NIM response:', error.response?.data);
+    console.error('[PROXY] NIM response:', bodyText);
 
     if (!res.headersSent) {
       res.status(error.response?.status || 500).json({
