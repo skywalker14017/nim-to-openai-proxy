@@ -89,8 +89,8 @@ const MODEL_MAPPING = {
   'glm-5.3': 'z-ai/glm-5.3',
   'glm-flash': 'z-ai/glm-5-3-flash',
   'm3.1': 'minimaxai/minimax-m3.1-flash',
-  'kimi': 'moonshotai/kimi-k3.1-pro'
-  'mistral-large': 'mistralai/Mistral Large 4'
+  'kimi': 'moonshotai/kimi-k3.1-pro',
+  'mistral-large': 'mistralai/Mistral Large 4',
 
   // Vision-Modelle — nur Modelle, die erfolgreich auf Chat-Completions antworten.
   // Getestet am: 2026-09-17 — meta/llama-3.2-11b-vision-instruct: HTTP 200 ✓
