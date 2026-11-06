@@ -86,8 +86,7 @@ const MODEL_MAPPING = {
   'google-light': 'google/gemma-4-31b-it',
   'google-lightest': 'meta/muse-glimmer-30b',
   'google-lighter': 'poolside/laguna-xs-2.1',
-  'glm-5.3': 'z-ai/glm-5.3',
-  'glm-flash': 'z-ai/glm-5-3-flash',
+  'glm-flash': 'z-ai/glm-5.3-flash',
   'm3.1': 'minimaxai/minimax-m3.1-flash',
   'kimi': 'moonshotai/kimi-k3.1-pro',
   'mistral-large': 'mistralai/mistral-large-4-1t-a52b', // always the damn comma
