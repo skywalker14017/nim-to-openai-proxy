@@ -5,8 +5,7 @@ Due to personal health reasons, Jontte (original owner) will no longer be able t
 
 ### Reasoning officially works! Every model (that supports reasoning) works. To use reasoning, use the [optional environmental variables](#optional-environment-variables) section!
 
-# If you get the error 'Forbidden: Invalid or missing authentication', please attempt regenerating your API key, I’m still not sure as to what is causing this, but regenerating API key seems to work. (for me)
-
+-# readme hasnt been updated for so long😭😭 ill get to it
 
 ### NVIDIA NIM to OpenAI Proxy
 Hello, this is my first ever project on Github that I am making public. This is essentially just a translation layer between the API format that NVIDIA NIM uses to the format OpenAI uses. Jontte made this originally by building on a script from a Reddit guide. Over the time of a month he iterated on it, fixed problems, added auth, more models, and removed/replaced deprecated models.
