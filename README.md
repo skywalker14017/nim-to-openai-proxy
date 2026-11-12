@@ -6,7 +6,7 @@ Due to personal health reasons, Jontte (original owner) will no longer be able t
 ### Reasoning officially works! Every model (that supports reasoning) works. To use reasoning, use the [optional environmental variables](#optional-environment-variables) section!
 
 readme hasnt been updated for so long😭😭 ill get to it
-
+weird the big huang didnt give kimi k3.1 for api access oh well he has another chinese “model” to attend to 
 ### NVIDIA NIM to OpenAI Proxy
 Hello, this is my first ever project on Github that I am making public. This is essentially just a translation layer between the API format that NVIDIA NIM uses to the format OpenAI uses. Jontte made this originally by building on a script from a Reddit guide. Over the time of a month he iterated on it, fixed problems, added auth, more models, and removed/replaced deprecated models.
 These are the current available models for usage, and the use cases for all of them. 
